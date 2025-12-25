@@ -10,7 +10,7 @@ const NodeCache = require('node-cache');
 
 // --- CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
-const PHP_WEBHOOK_URL = process.env.PHP_WEBHOOK_URL || 'https://msjdatasubs.com.ng/bot/route.php';
+const PHP_WEBHOOK_URL = process.env.PHP_WEBHOOK_URL || 'https://msjdatasubs.com.ng/whatbot/route.php';
 const API_SECRET = process.env.API_SECRET || 'changethis_secret_key';
 
 const app = express();
@@ -211,3 +211,4 @@ app.listen(PORT, () => {
     console.log(`Bridge listening on port ${PORT}`);
     backend();
 });
+
