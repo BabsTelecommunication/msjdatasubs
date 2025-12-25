@@ -1,6 +1,6 @@
 /**
  * BABSPAY WHATSAPP BRIDGE
- * Stable Baileys Implementation
+ * Modern Stable Baileys v5+
  */
 
 const crypto = require('crypto');
@@ -25,21 +25,19 @@ const PORT = process.env.PORT || 3000;
 const PHP_WEBHOOK_URL = process.env.PHP_WEBHOOK_URL || 'https://msjdatasubs.com.ng/bot/route.php';
 const API_SECRET = process.env.API_SECRET || 'changethis_secret_key';
 
-// Persistent storage (Render / VPS safe)
+// Persistent storage
 const DISK_PATH = '/var/lib/data';
 const AUTH_DIR = fs.existsSync(DISK_PATH)
     ? `${DISK_PATH}/auth_info_baileys`
     : 'auth_info_baileys';
 
-if (!fs.existsSync(AUTH_DIR)) {
-    fs.mkdirSync(AUTH_DIR, { recursive: true });
-}
+if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 
 console.log('Auth Storage:', AUTH_DIR);
 
 // ================= GLOBAL STATE =================
 let sock = null;
-let pairingCode = null;
+let qrCode = null;
 let connectionStatus = 'starting';
 const msgRetryCounterCache = new NodeCache();
 
@@ -48,8 +46,6 @@ async function startWhatsApp() {
     try {
         const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
         const { version } = await fetchLatestBaileysVersion();
-
-        console.log('WhatsApp Protocol Version:', version);
 
         sock = makeWASocket({
             version,
@@ -66,23 +62,21 @@ async function startWhatsApp() {
         sock.ev.on('creds.update', saveCreds);
 
         sock.ev.on('connection.update', (update) => {
-            const { connection, lastDisconnect } = update;
+            const { connection, lastDisconnect, qr } = update;
+            if (qr) qrCode = qr;
+
             console.log('Connection Update:', update);
 
             if (connection === 'open') {
                 connectionStatus = 'connected';
-                pairingCode = null;
+                qrCode = null;
                 console.log('✅ WhatsApp Connected');
             }
 
             if (connection === 'close') {
                 connectionStatus = 'disconnected';
-
-                const statusCode =
-                    lastDisconnect?.error?.output?.statusCode || 500;
-
-                const shouldReconnect =
-                    statusCode !== DisconnectReason.loggedOut;
+                const statusCode = lastDisconnect?.error?.output?.statusCode || 500;
+                const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
                 console.log(`❌ Connection Closed (${statusCode})`);
 
@@ -99,7 +93,6 @@ async function startWhatsApp() {
 
         sock.ev.on('messages.upsert', async ({ messages, type }) => {
             if (type !== 'notify') return;
-
             for (const msg of messages) {
                 if (msg.key.fromMe) continue;
 
@@ -145,58 +138,23 @@ app.get('/', (req, res) => {
 
     if (connectionStatus === 'connected') {
         html = `<h2 style="color:green">✅ WhatsApp Connected</h2>`;
-    } else if (pairingCode) {
+    } else if (qrCode) {
         html = `
-        <h2>Link WhatsApp</h2>
-        <h3>Pairing Code</h3>
-        <div style="font-size:24px;letter-spacing:3px">${pairingCode}</div>
-        <p>WhatsApp → Settings → Linked Devices → Link with phone number</p>
+        <h2>Scan QR with WhatsApp</h2>
+        <img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(qrCode)}" />
+        <p>Open WhatsApp → Settings → Linked Devices → Link a Device</p>
         <a href="/">Refresh</a>
         `;
     } else {
-        html = `
-        <h2>WhatsApp Bridge</h2>
-        <p>Status: ${connectionStatus}</p>
-        <form method="POST" action="/pair">
-            <input name="phone" placeholder="2348012345678" required />
-            <br/><br/>
-            <button>Get Pairing Code</button>
-        </form>
-        <br/>
-        <a href="/reset" style="color:red">Reset Session</a>
-        `;
+        html = `<h2>WhatsApp Bridge</h2>
+                <p>Status: ${connectionStatus}</p>`;
     }
 
     res.send(`<html><body style="text-align:center;font-family:sans-serif">${html}</body></html>`);
 });
 
-app.post('/pair', async (req, res) => {
-    const phone = req.body.phone;
-
-    if (!sock) return res.send('Socket not ready. Wait.');
-
-    if (sock.authState.creds.registered)
-        return res.send('Already paired.');
-
-    if (connectionStatus === 'connected')
-        return res.send('Already connected.');
-
-    res.send('Requesting pairing code... Refresh page in 5 seconds.');
-
-    setTimeout(async () => {
-        try {
-            const code = await sock.requestPairingCode(phone);
-            pairingCode = code?.match(/.{1,4}/g)?.join('-');
-            console.log('🔐 Pairing Code:', pairingCode);
-        } catch (err) {
-            console.error('Pairing Error:', err.message);
-        }
-    }, 3000);
-});
-
 app.post('/send-message', async (req, res) => {
     const { secret, to, message } = req.body;
-
     if (secret !== API_SECRET)
         return res.status(403).json({ error: 'Forbidden' });
 
