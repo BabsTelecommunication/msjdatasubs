@@ -1,216 +1,226 @@
+/**
+ * BABSPAY WHATSAPP BRIDGE
+ * Stable Baileys Implementation
+ */
+
 const crypto = require('crypto');
-global.crypto = crypto; // Polyfill for Baileys
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, delay } = require('@whiskeysockets/baileys');
-const { Boom } = require('@hapi/boom');
+global.crypto = crypto;
+
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
+    fetchLatestBaileysVersion,
+    Browsers
+} = require('@whiskeysockets/baileys');
+
 const express = require('express');
 const axios = require('axios');
 const pino = require('pino');
 const fs = require('fs');
 const NodeCache = require('node-cache');
 
-// --- CONFIGURATION ---
+// ================= CONFIG =================
 const PORT = process.env.PORT || 3000;
 const PHP_WEBHOOK_URL = process.env.PHP_WEBHOOK_URL || 'https://msjdatasubs.com.ng/bot/route.php';
 const API_SECRET = process.env.API_SECRET || 'changethis_secret_key';
 
-const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-// PERSISTENCE CONFIGURATION
-// Check if Render Persistent Disk is available at /var/lib/data
+// Persistent storage (Render / VPS safe)
 const DISK_PATH = '/var/lib/data';
-const AUTH_DIR = fs.existsSync(DISK_PATH) ? `${DISK_PATH}/auth_info_baileys` : 'auth_info_baileys';
-console.log(`Storage Path: ${AUTH_DIR}`);
+const AUTH_DIR = fs.existsSync(DISK_PATH)
+    ? `${DISK_PATH}/auth_info_baileys`
+    : 'auth_info_baileys';
 
 if (!fs.existsSync(AUTH_DIR)) {
     fs.mkdirSync(AUTH_DIR, { recursive: true });
 }
 
-// Global State
-let pairingCode = null;
-let connectionStatus = 'initializing';
+console.log('Auth Storage:', AUTH_DIR);
+
+// ================= GLOBAL STATE =================
 let sock = null;
+let pairingCode = null;
+let connectionStatus = 'starting';
 const msgRetryCounterCache = new NodeCache();
 
-// Main Socket function
-async function backend() {
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+// ================= WHATSAPP BACKEND =================
+async function startWhatsApp() {
+    try {
+        const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+        const { version } = await fetchLatestBaileysVersion();
 
-    sock = makeWASocket({
-        auth: state,
-        printQRInTerminal: false,
-        logger: pino({ level: 'warn' }),
-        browser: ['Chrome (Linux)', 'Chrome', '124.0.6367.60'],
-        connectTimeoutMs: 60000,
-        keepAliveIntervalMs: 10000,
-        emitOwnEvents: true,
-        retryRequestDelayMs: 250,
-        markOnlineOnConnect: true,
-        syncFullHistory: false,
-        usePairingCode: true,
-        msgRetryCounterCache
-    });
+        console.log('WhatsApp Protocol Version:', version);
 
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update;
-        console.log('Connection Update:', update);
+        sock = makeWASocket({
+            version,
+            auth: state,
+            logger: pino({ level: 'silent' }),
+            browser: Browsers.macOS('Chrome'),
+            printQRInTerminal: false,
+            markOnlineOnConnect: false,
+            syncFullHistory: false,
+            keepAliveIntervalMs: 20000,
+            msgRetryCounterCache
+        });
 
-        if (connection === 'close') {
-            const err = lastDisconnect?.error;
-            const statusCode = (err && err.output && err.output.statusCode) ? err.output.statusCode : 500;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        sock.ev.on('creds.update', saveCreds);
 
-            console.log(`Connection closed. Status: ${statusCode}, Reconnect: ${shouldReconnect}`);
+        sock.ev.on('connection.update', (update) => {
+            const { connection, lastDisconnect } = update;
+            console.log('Connection Update:', update);
 
-            connectionStatus = 'disconnected';
-
-            if (shouldReconnect) {
-                setTimeout(() => backend(), 5000);
-            } else {
-                console.log('Logged out. Clearing auth and restarting...');
-                fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-                backend();
+            if (connection === 'open') {
+                connectionStatus = 'connected';
+                pairingCode = null;
+                console.log('✅ WhatsApp Connected');
             }
-        } else if (connection === 'open') {
-            console.log('Opened connection to WhatsApp!');
-            connectionStatus = 'connected';
-            pairingCode = null;
-        }
-    });
 
-    sock.ev.on('creds.update', saveCreds);
+            if (connection === 'close') {
+                connectionStatus = 'disconnected';
 
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type === 'notify') {
-            for (const msg of messages) {
-                if (!msg.key.fromMe) {
-                    const remoteJid = msg.key.remoteJid;
-                    const textMessage = msg.message.conversation ||
-                        msg.message.extendedTextMessage?.text ||
-                        msg.message.imageMessage?.caption || "";
+                const statusCode =
+                    lastDisconnect?.error?.output?.statusCode || 500;
 
-                    console.log(`Msg from ${remoteJid}: ${textMessage}`);
+                const shouldReconnect =
+                    statusCode !== DisconnectReason.loggedOut;
 
-                    try {
-                        await axios.post(PHP_WEBHOOK_URL, {
-                            secret: API_SECRET,
-                            type: 'message',
-                            data: {
-                                from: remoteJid,
-                                body: textMessage,
-                                name: msg.pushName || 'User'
-                            }
-                        });
-                    } catch (error) {
-                        console.error("Forwarding Error:", error.message);
-                    }
+                console.log(`❌ Connection Closed (${statusCode})`);
+
+                if (shouldReconnect) {
+                    console.log('🔁 Reconnecting in 30 seconds...');
+                    setTimeout(startWhatsApp, 30000);
+                } else {
+                    console.log('🚨 Logged out. Clearing session...');
+                    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+                    setTimeout(startWhatsApp, 5000);
                 }
             }
-        }
-    });
+        });
+
+        sock.ev.on('messages.upsert', async ({ messages, type }) => {
+            if (type !== 'notify') return;
+
+            for (const msg of messages) {
+                if (msg.key.fromMe) continue;
+
+                const text =
+                    msg.message?.conversation ||
+                    msg.message?.extendedTextMessage?.text ||
+                    msg.message?.imageMessage?.caption ||
+                    '';
+
+                const from = msg.key.remoteJid;
+
+                console.log(`📩 ${from}: ${text}`);
+
+                try {
+                    await axios.post(PHP_WEBHOOK_URL, {
+                        secret: API_SECRET,
+                        type: 'message',
+                        data: {
+                            from,
+                            body: text,
+                            name: msg.pushName || 'User'
+                        }
+                    });
+                } catch (err) {
+                    console.error('Webhook Error:', err.message);
+                }
+            }
+        });
+
+    } catch (err) {
+        console.error('Startup Error:', err);
+        setTimeout(startWhatsApp, 30000);
+    }
 }
 
-// --- WEB INTERFACE ---
+// ================= EXPRESS SERVER =================
+const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
 app.get('/', (req, res) => {
-    let content = '';
+    let html = '';
 
     if (connectionStatus === 'connected') {
-        content = `<h1 style="color:green">Active & Connected!</h1><p>The bot is running successfully.</p>`;
+        html = `<h2 style="color:green">✅ WhatsApp Connected</h2>`;
     } else if (pairingCode) {
-        content = `
-            <h1>Link with Phone Number</h1>
-            <h3>Pairing Code: <span style="background:#eee; padding:5px 10px; letter-spacing:3px;">${pairingCode}</span></h3>
-            <p>1. Open WhatsApp on your phone</p>
-            <p>2. Go to Settings > Linked Devices > Link a Device > <b>Link with phone number</b></p>
-            <p>3. Enter the code above.</p>
-            <p><a href="/">Refresh Code</a></p>
+        html = `
+        <h2>Link WhatsApp</h2>
+        <h3>Pairing Code</h3>
+        <div style="font-size:24px;letter-spacing:3px">${pairingCode}</div>
+        <p>WhatsApp → Settings → Linked Devices → Link with phone number</p>
+        <a href="/">Refresh</a>
         `;
     } else {
-        content = `
-            <h1>WhatsApp Bridge Setup</h1>
-            <p>Status: ${connectionStatus}</p>
-            <p style="font-size:0.8em; color:gray;">(Status 405 is normal during initial startup loop, wait for 'connected')</p>
-            <form action="/pair" method="POST">
-                <label>Enter Bot Phone Number (e.g. 2348012345678):</label><br/>
-                <input type="text" name="phone" required placeholder="23480..." style="padding:10px; margin:10px; width:200px;"><br/>
-                <button type="submit" style="padding:10px 20px;">Get Pairing Code</button>
-            </form>
-             <br/><br/>
-            <a href="/reset" style="color:red; font-size:0.8em;">[Panic Button] Reset Session</a>
+        html = `
+        <h2>WhatsApp Bridge</h2>
+        <p>Status: ${connectionStatus}</p>
+        <form method="POST" action="/pair">
+            <input name="phone" placeholder="2348012345678" required />
+            <br/><br/>
+            <button>Get Pairing Code</button>
+        </form>
+        <br/>
+        <a href="/reset" style="color:red">Reset Session</a>
         `;
     }
 
-    res.send(`
-        <html>
-        <head>
-            <title>WhatsApp Bridge</title>
-            <style>body{font-family:sans-serif; text-align:center; padding-top:50px;}</style>
-        </head>
-        <body>${content}</body>
-        </html>
-    `);
+    res.send(`<html><body style="text-align:center;font-family:sans-serif">${html}</body></html>`);
 });
 
 app.post('/pair', async (req, res) => {
     const phone = req.body.phone;
-    if (!phone) return res.send('Phone required');
 
-    if (!sock) return res.send('Socket not ready. Wait a few seconds.');
+    if (!sock) return res.send('Socket not ready. Wait.');
 
-    if (sock.authState.creds.registered) {
-        return res.send('Error: Bot is ALREADY registered! Reset session if you want to re-pair.');
-    }
+    if (sock.authState.creds.registered)
+        return res.send('Already paired.');
 
-    if (connectionStatus === 'connected') return res.send('Already Connected!');
+    if (connectionStatus === 'connected')
+        return res.send('Already connected.');
 
-    console.log("Requesting Pairing Code for:", phone);
-    res.send('Requesting code... Please wait 5 seconds then <a href="/">Click Here to Refresh</a>.');
+    res.send('Requesting pairing code... Refresh page in 5 seconds.');
 
     setTimeout(async () => {
         try {
-            if (!sock.authState.creds.registered) {
-                const code = await sock.requestPairingCode(phone);
-                pairingCode = code?.match(/.{1,4}/g)?.join('-') || code;
-                console.log("Pairing Code generated:", pairingCode);
-            }
-        } catch (e) {
-            console.error("Pairing Error:", e.message);
+            const code = await sock.requestPairingCode(phone);
+            pairingCode = code?.match(/.{1,4}/g)?.join('-');
+            console.log('🔐 Pairing Code:', pairingCode);
+        } catch (err) {
+            console.error('Pairing Error:', err.message);
         }
-    }, 1000);
+    }, 3000);
 });
 
 app.post('/send-message', async (req, res) => {
     const { secret, to, message } = req.body;
-    if (secret !== API_SECRET) return res.status(403).json({ error: 'Access Denied' });
+
+    if (secret !== API_SECRET)
+        return res.status(403).json({ error: 'Forbidden' });
 
     try {
         const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
         await sock.sendMessage(jid, { text: message });
-        res.json({ status: 'success' });
-    } catch (error) {
-        res.status(500).json({ error: 'Failed', details: error.message });
+        res.json({ status: 'sent' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 
 app.get('/reset', (req, res) => {
     try {
-        if (sock) {
-            try { sock.end(undefined); } catch { }
-            sock = null;
-        }
-        if (fs.existsSync(AUTH_DIR)) {
-            fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-        }
-        res.send('Reset. Restarting...');
+        if (sock) sock.end();
+        fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+        res.send('Session reset. Restarting...');
         setTimeout(() => process.exit(0), 1000);
     } catch (e) {
-        res.send("Reset failed: " + e.message);
+        res.send('Reset failed');
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`Bridge listening on port ${PORT}`);
-    backend();
+    console.log(`Server running on port ${PORT}`);
+    startWhatsApp();
 });
-
