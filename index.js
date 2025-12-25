@@ -10,7 +10,7 @@ const NodeCache = require('node-cache');
 
 // --- CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
-const PHP_WEBHOOK_URL = process.env.PHP_WEBHOOK_URL || 'https://msjdatasubs.com.ng/whatbot/route.php';
+const PHP_WEBHOOK_URL = process.env.PHP_WEBHOOK_URL || 'https://msjdatasubs.com.ng/bot/route.php';
 const API_SECRET = process.env.API_SECRET || 'changethis_secret_key';
 
 const app = express();
@@ -41,6 +41,7 @@ async function backend() {
         auth: state,
         printQRInTerminal: false,
         logger: pino({ level: 'warn' }),
+        browser: ['Chrome (Linux)', 'Chrome', '124.0.6367.60'],
         connectTimeoutMs: 60000,
         keepAliveIntervalMs: 10000,
         emitOwnEvents: true,
@@ -129,6 +130,7 @@ app.get('/', (req, res) => {
         content = `
             <h1>WhatsApp Bridge Setup</h1>
             <p>Status: ${connectionStatus}</p>
+            <p style="font-size:0.8em; color:gray;">(Status 405 is normal during initial startup loop, wait for 'connected')</p>
             <form action="/pair" method="POST">
                 <label>Enter Bot Phone Number (e.g. 2348012345678):</label><br/>
                 <input type="text" name="phone" required placeholder="23480..." style="padding:10px; margin:10px; width:200px;"><br/>
@@ -211,4 +213,3 @@ app.listen(PORT, () => {
     console.log(`Bridge listening on port ${PORT}`);
     backend();
 });
-
