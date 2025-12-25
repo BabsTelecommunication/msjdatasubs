@@ -6,47 +6,54 @@ const express = require('express');
 const axios = require('axios');
 const pino = require('pino');
 const fs = require('fs');
-
-// Node Cache for retry counters
 const NodeCache = require('node-cache');
-const msgRetryCounterCache = new NodeCache();
 
 // --- CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
-const PHP_WEBHOOK_URL = process.env.PHP_WEBHOOK_URL || 'https://babspay.com.ng/bot/bridge_webhook.php';
+const PHP_WEBHOOK_URL = process.env.PHP_WEBHOOK_URL || 'https://msjdatasubs.com.ng/bot/route.php';
 const API_SECRET = process.env.API_SECRET || 'changethis_secret_key';
 
 const app = express();
 app.use(express.json());
-app.use(express.urlencoded({ extended: true })); // For form submission
+app.use(express.urlencoded({ extended: true }));
+
+// PERSISTENCE CONFIGURATION
+// Check if Render Persistent Disk is available at /var/lib/data
+const DISK_PATH = '/var/lib/data';
+const AUTH_DIR = fs.existsSync(DISK_PATH) ? `${DISK_PATH}/auth_info_baileys` : 'auth_info_baileys';
+console.log(`Storage Path: ${AUTH_DIR}`);
+
+if (!fs.existsSync(AUTH_DIR)) {
+    fs.mkdirSync(AUTH_DIR, { recursive: true });
+}
 
 // Global State
 let pairingCode = null;
 let connectionStatus = 'initializing';
 let sock = null;
+const msgRetryCounterCache = new NodeCache();
 
 // Main Socket function
 async function backend() {
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
     sock = makeWASocket({
         auth: state,
         printQRInTerminal: false,
         logger: pino({ level: 'warn' }),
-        browser: ['Ubuntu', 'Chrome', '20.0.04'],
         connectTimeoutMs: 60000,
         keepAliveIntervalMs: 10000,
         emitOwnEvents: true,
         retryRequestDelayMs: 250,
-        markOnlineOnConnect: false,
+        markOnlineOnConnect: true,
         syncFullHistory: false,
         usePairingCode: true,
-        msgRetryCounterCache // Fixes some decrypt/connect issues
+        msgRetryCounterCache
     });
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
-        console.log('Connection Update:', update); // DEBUG LOG
+        console.log('Connection Update:', update);
 
         if (connection === 'close') {
             const err = lastDisconnect?.error;
@@ -55,14 +62,13 @@ async function backend() {
 
             console.log(`Connection closed. Status: ${statusCode}, Reconnect: ${shouldReconnect}`);
 
-            // If 405 or 515, it implies a restart loop might occur, wait longer
             connectionStatus = 'disconnected';
 
             if (shouldReconnect) {
                 setTimeout(() => backend(), 5000);
             } else {
                 console.log('Logged out. Clearing auth and restarting...');
-                fs.rmSync('auth_info_baileys', { recursive: true, force: true });
+                fs.rmSync(AUTH_DIR, { recursive: true, force: true });
                 backend();
             }
         } else if (connection === 'open') {
@@ -120,11 +126,9 @@ app.get('/', (req, res) => {
             <p><a href="/">Refresh Code</a></p>
         `;
     } else {
-        // Form to enter phone number
         content = `
             <h1>WhatsApp Bridge Setup</h1>
             <p>Status: ${connectionStatus}</p>
-            <p style="font-size:0.8em; color:gray;">(Status 405 is normal during initial startup loop, wait for 'connected')</p>
             <form action="/pair" method="POST">
                 <label>Enter Bot Phone Number (e.g. 2348012345678):</label><br/>
                 <input type="text" name="phone" required placeholder="23480..." style="padding:10px; margin:10px; width:200px;"><br/>
@@ -146,14 +150,12 @@ app.get('/', (req, res) => {
     `);
 });
 
-// Trigger Pairing
 app.post('/pair', async (req, res) => {
     const phone = req.body.phone;
     if (!phone) return res.send('Phone required');
 
     if (!sock) return res.send('Socket not ready. Wait a few seconds.');
 
-    // CRITICAL: Check if already registered
     if (sock.authState.creds.registered) {
         return res.send('Error: Bot is ALREADY registered! Reset session if you want to re-pair.');
     }
@@ -163,7 +165,6 @@ app.post('/pair', async (req, res) => {
     console.log("Requesting Pairing Code for:", phone);
     res.send('Requesting code... Please wait 5 seconds then <a href="/">Click Here to Refresh</a>.');
 
-    // Use a delay to allow the response to send first, but catch errors properly
     setTimeout(async () => {
         try {
             if (!sock.authState.creds.registered) {
@@ -177,8 +178,6 @@ app.post('/pair', async (req, res) => {
     }, 1000);
 });
 
-
-// Send Message API
 app.post('/send-message', async (req, res) => {
     const { secret, to, message } = req.body;
     if (secret !== API_SECRET) return res.status(403).json({ error: 'Access Denied' });
@@ -195,11 +194,11 @@ app.post('/send-message', async (req, res) => {
 app.get('/reset', (req, res) => {
     try {
         if (sock) {
-            sock.end(undefined);
+            try { sock.end(undefined); } catch { }
             sock = null;
         }
-        if (fs.existsSync('auth_info_baileys')) {
-            fs.rmSync('auth_info_baileys', { recursive: true, force: true });
+        if (fs.existsSync(AUTH_DIR)) {
+            fs.rmSync(AUTH_DIR, { recursive: true, force: true });
         }
         res.send('Reset. Restarting...');
         setTimeout(() => process.exit(0), 1000);
